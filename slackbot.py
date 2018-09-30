@@ -1,7 +1,13 @@
+import os
 import config
 import datetime
-from slackclient import SlackClient
 import pandas
+
+from slackclient import SlackClient
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from oauth2client import service_account
+from httplib2 import Http
 
 # Slack API JSON Fields
 COLOR = "color"
@@ -16,19 +22,31 @@ TRUE = "true"
 VALUE = "value"
 
 # Slack Summary Headers
+ABSOLUTE_DRAWDOWN = "Absolute Drawdown"
 EXPECTED_PAYOFF = "Expected Payoff"
 GROSS_LOSS = "Gross Loss"
 GROSS_PROFIT = "Gross Profit"
 INITIAL_DEPOSIT = "Initial Deposit"
 LOSS_TRADES = "Loss Trades (% of Total)"
-PROFIT_FACTOR = "Profit Fator"
+PROFIT_FACTOR = "Profit Factor"
 PROFIT_TRADES = "Profit Trades (% of Total)"
 TOTAL_TRADES = "Total Trades"
 TOTAL_PROFIT = "Total Net Profit"
 
 
 message_text = ""
+
+# Create Slack Client
 slack_client = SlackClient(config.BOT_TOKEN)
+
+# Perform OAuth2.0 authorization.
+credentials = service_account.ServiceAccountCredentials.from_json_keyfile_name(
+        config.CREDENTIALS, scopes=config.SCOPES)
+
+# Create an authorized Drive API client.
+http = Http()
+credentials.authorize(http)
+drive_service = build(config.DRIVE_BUILD, config.DRIVE_VERSION, http=http)
 
 
 def send_message(message):
@@ -37,7 +55,7 @@ def send_message(message):
 
 def send_attachment(pretext, color, title, title_link, attachment_fields, footer):
     attachment = parse_attachment(pretext, color, title, title_link, attachment_fields, footer)
-    slack_client.api_call(config.API_POST, channel=config.SLACK_CHANNEL, attachments=attachment)
+    return slack_client.api_call(config.API_POST, channel=config.SLACK_CHANNEL, attachments=attachment)["ok"]
 
 
 def parse_attachment(pretext, color, title, title_link, fields, footer):
@@ -82,10 +100,14 @@ def generate_fields_from_csv(csv_file_name):
     initial_deposit = calculate_initial_deposit(data_frame)
     initial_deposit_json = {TITLE: INITIAL_DEPOSIT, VALUE: str(round(initial_deposit, 2)), SHORT: TRUE}
 
-    json_fields = [total_net_profit_json, total_trades_json, gross_profit_json, gross_loss_json,
-                   profit_trades_json, loss_trades_json, profit_factor_json, expected_payoff_json, initial_deposit_json]
+    minimal_balance = calculate_minimal_balance(data_frame)
+    absolute_drawdown = initial_deposit - minimal_balance
+    absolute_drawdown_json = {TITLE: ABSOLUTE_DRAWDOWN, VALUE: str(round(absolute_drawdown, 2)), SHORT: TRUE}
 
-    return json_fields, data_frame_title.columns[0]
+    json_fields = [total_net_profit_json, total_trades_json, gross_profit_json, gross_loss_json,
+                   profit_trades_json, loss_trades_json, profit_factor_json, expected_payoff_json, initial_deposit_json, absolute_drawdown_json]
+
+    return json_fields, data_frame_title.columns[0], data_frame
 
 
 def calculate_total_trades(data_frame):
@@ -116,17 +138,51 @@ def calculate_initial_deposit(data_frame):
         return data_frame[config.ACCOUNT_BALANCE][0]+abs(first_profit)
 
 
+def calculate_minimal_balance(data_frame):
+    return data_frame[config.ACCOUNT_BALANCE].min()
+
+
+def upload_file_to_drive(fname):
+    file_metadata = get_file_metadata(fname)
+    media = MediaFileUpload(fname,
+                            mimetype=config.MIME_TYPE,
+                            resumable=True)
+    file = drive_service.files().create(body=file_metadata,
+                                        media_body=media,
+                                        fields='id').execute()
+    file_id = file.get('id')
+    print('File id: ' + file_id)
+    return file_id
+
+
+def get_file_metadata(file_name):
+    return {
+        'name': file_name,
+        'parents': [config.FOLDER_ID],
+        'mimeType': config.APP_MIME_TYPE
+    }
+
+
+def read_upload_files():
+    for file_name in config.CSV_FILES:
+        fields, title, data_frame = generate_fields_from_csv(file_name)
+        today = str(datetime.date.today())
+        if send_attachment(config.MSG_SUMMARY,
+                           config.MSG_COLOR,
+                           title + " " + today,
+                           "http://www.google.com",
+                           fields,
+                           config.MSG_FOOTER):
+            fname = today + title + '.csv'
+            data_frame.to_csv(fname, sep=',')
+            file_id = upload_file_to_drive(fname)
+            if file_id:
+                os.remove(fname)
+
+
 if __name__ == "__main__":
     if slack_client.rtm_connect(with_team_state=False):
         print("Slack Bot connected and ready to send messages!")
-        fields = []
-        for file_name in config.CSV_FILES:
-            fields, title = generate_fields_from_csv(file_name)
-            send_attachment(config.MSG_SUMMARY,
-                            config.MSG_COLOR,
-                            title + " " + str(datetime.date.today()),
-                            "http://www.google.com",
-                            fields,
-                            config.MSG_FOOTER)
+        read_upload_files()
     else:
         print("Error connecting to Slack please refer to the stacktrace")
